@@ -13,9 +13,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"tp-inspector/internal/cri"
 )
 
 //go:embed index.html
@@ -31,23 +34,30 @@ var skipDirs = map[string]bool{
 	"build": true, "__pycache__": true, ".venv": true, "dist": true,
 }
 
-type server struct{ root, tracesURL string }
+type server struct {
+	root, tracesURL string
+	classes         *cri.Source // nil: no class filter
+	filter          cri.Filter
+}
 
 // Start serves the repos found in root (one directory per login) on addr,
 // e.g. "127.0.0.1:0" for a free port. tracesURL is the Forge traces page of the
-// assignment; the page appends ?q=<login>. It returns the URL and a stop function.
-func Start(root, addr, tracesURL string) (string, func(), error) {
+// assignment; the page appends ?q=<login>. classes and filter feed the class
+// filter of the page. It returns the URL and a stop function.
+func Start(root, addr, tracesURL string, classes *cri.Source, filter cri.Filter) (string, func(), error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return "", nil, err
 	}
-	s := &server{root: root, tracesURL: tracesURL}
+	s := &server{root: root, tracesURL: tracesURL, classes: classes, filter: filter}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/info", s.info)
 	mux.HandleFunc("/api/repos", s.repos)
 	mux.HandleFunc("/api/tree", s.tree)
 	mux.HandleFunc("/api/file", s.file)
 	mux.HandleFunc("/api/archive", s.archive)
+	mux.HandleFunc("/api/classes", s.classList)
+	mux.HandleFunc("/api/members", s.members)
 	mux.Handle("/", http.FileServerFS(static))
 	srv := &http.Server{Handler: mux}
 	go srv.Serve(ln)
@@ -59,7 +69,20 @@ func Open(url string) error {
 	if b := os.Getenv("BROWSER"); b != "" {
 		candidates = append(candidates, []string{b})
 	}
+	if runtime.GOOS == "darwin" {
+		// "open" only on macOS: on some Linux distros it is an alias of openvt.
+		candidates = append(candidates,
+			[]string{"open"},
+			[]string{"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"},
+			[]string{"/Applications/Firefox.app/Contents/MacOS/firefox"},
+			[]string{"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"},
+			[]string{"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"},
+			[]string{"/Applications/Chromium.app/Contents/MacOS/Chromium"},
+			[]string{"/Applications/Safari.app/Contents/MacOS/Safari"},
+		)
+	}
 	candidates = append(candidates,
+		// WSL / Windows
 		[]string{"wslview"},
 		[]string{"explorer.exe"},
 		[]string{"/mnt/c/Windows/explorer.exe"},
@@ -67,8 +90,17 @@ func Open(url string) error {
 		[]string{"/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe"},
 		[]string{"/mnt/c/Program Files/Mozilla Firefox/firefox.exe"},
 		[]string{"cmd.exe", "/c", "start", ""},
-		[]string{"google-chrome"}, []string{"chromium"}, []string{"firefox"},
+		// Linux
 		[]string{"xdg-open"},
+		[]string{"gio", "open"},
+		[]string{"gnome-open"},
+		[]string{"kde-open"},
+		[]string{"sensible-browser"},
+		[]string{"x-www-browser"},
+		[]string{"google-chrome"}, []string{"google-chrome-stable"},
+		[]string{"chromium"}, []string{"chromium-browser"},
+		[]string{"firefox"}, []string{"brave-browser"}, []string{"microsoft-edge"},
+		[]string{"vivaldi"}, []string{"opera"}, []string{"epiphany"}, []string{"falkon"},
 	)
 	for _, c := range candidates {
 		path, err := exec.LookPath(c[0])
@@ -102,8 +134,61 @@ func (s *server) repoDir(login string) (string, bool) {
 	return dir, true
 }
 
+// info exposes the traces URL and the repos root.
 func (s *server) info(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]string{"traces": s.tracesURL})
+	writeJSON(w, map[string]string{"traces": s.tracesURL, "root": s.root})
+}
+
+type classReply struct {
+	Slug     string `json:"slug"`
+	Name     string `json:"name"`
+	Campus   string `json:"campus"`
+	Promo    string `json:"promo"`
+	Rank     int    `json:"rank"` // program order: prepa, ING, apprentices, cyber
+	Semester string `json:"semester"`
+	Code     string `json:"code"`
+	Fits     bool   `json:"fits"` // can take this activity
+}
+
+// classList returns the CRI classes (cached by cri.Source) and which ones fit
+// the activity.
+func (s *server) classList(w http.ResponseWriter, r *http.Request) {
+	if s.classes == nil {
+		http.Error(w, "the CRI API is not available", http.StatusServiceUnavailable)
+		return
+	}
+	cat, err := s.classes.Catalog()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	campuses := map[string]string{"": "Other"}
+	for _, c := range cat.Campuses {
+		campuses[c.Slug] = c.Name
+	}
+	out := make([]classReply, len(cat.Classes))
+	for i, c := range cat.Classes {
+		out[i] = classReply{Slug: c.Slug, Name: c.Name, Campus: c.Campus, Promo: c.Promo, Rank: cri.ProgramRank(c.Program),
+			Semester: c.SemesterLabel(), Code: c.Code, Fits: s.filter.Match(c)}
+	}
+	writeJSON(w, map[string]any{"filter": s.filter.Label(), "campuses": campuses, "classes": out})
+}
+
+// members returns the logins of the classes given as ?slug= (repeatable).
+func (s *server) members(w http.ResponseWriter, r *http.Request) {
+	if s.classes == nil {
+		http.Error(w, "the CRI API is not available", http.StatusServiceUnavailable)
+		return
+	}
+	logins, err := s.classes.MembersOf(r.URL.Query()["slug"])
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if logins == nil {
+		logins = []string{}
+	}
+	writeJSON(w, logins)
 }
 
 func (s *server) repos(w http.ResponseWriter, r *http.Request) {
